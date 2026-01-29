@@ -1,4 +1,6 @@
-# quant-proj — Quant Research Lab (Risk Engines + LSTM Alpha + Walk-Forward)
+# Cross-Sectional LSTM Equity Selector (with Walk-Forward Backtesting)
+
+## Quant Research Project (Risk Engines + LSTM Alpha + Walk-Forward)
 
 A single-user, local-first quant research project that:
 
@@ -122,10 +124,10 @@ Implemented so far:
 - Risk parity-style baseline
 - LSTM alpha training + IC evaluation
 - LSTM Top-N strategy with:
-- - buffer/hysteresis
-- - rank weighting
-- - vol targeting
-- - benchmark + risk-matched comparisons
+  - buffer/hysteresis
+  - rank weighting
+  - vol targeting
+  - benchmark + risk-matched comparisons
 - Walk-forward evaluation across multiple years (annual refits)
 
 ## Practical Notes
