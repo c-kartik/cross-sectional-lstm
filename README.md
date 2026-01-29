@@ -7,7 +7,7 @@ A single-user, local-first quant research project that:
 - Pulls daily equity data via **yfinance**
 - Caches OHLCV data as **Parquet**
 - Runs **cost-aware backtests** with turnover + exposure metrics
-- Implements **risk engines** (trend/vol-targeting, risk parity-style)
+- Implements **risk engines** (trend/vol-targeting, inverse-vol baseline)
 - Implements an **LSTM alpha module** for **cross-sectional stock ranking**
 - Validates with **walk-forward retraining** (annual refits, out-of-sample years)
 
@@ -23,6 +23,14 @@ A single-user, local-first quant research project that:
 - Normalizes columns and stores per-ticker Parquet caches
 - Loads cached data into a unified `(date, ticker)` MultiIndex for research and modeling
 
+#### 1A) Universe + horizon + rebalance frequency
+
+- **Universe:** user-defined list in `src/universe/custom.py`
+- **Label horizon:** 5 trading days (`fwd_ret_5d`)
+- **Rebalance:** weekly (Fri close → trade next session)
+- **Portfolio:** Top-N long-only, rank-weighted, buffer rule
+- **Risk:** volatility targeting + leverage cap + SPY SMA regime filter
+
 ### 2) Backtest engine (cost-aware)
 
 - Converts sparse “rebalance-day targets” into daily holdings (ffill)
@@ -37,10 +45,11 @@ A single-user, local-first quant research project that:
 - **Trend-following (long-only) + vol targeting**
   - Uses an SMA regime filter (SPY) to reduce exposure in down regimes
   - Targets a desired annualized volatility using trailing realized vol
-- **Risk parity-style (inverse-vol) + regime + vol targeting**
+- **Inverse-volatility baseline (risk parity-ish) + regime + vol targeting**
   - Allocates by inverse trailing volatility
   - Optionally gates exposure using SPY regime
   - Targets volatility similarly to the trend risk engine
+  - **I use inverse-vol weighting, not equal-risk-contribution optimization using the full covariance (correlations).**
 
 ### 4) LSTM alpha (cross-sectional ranking)
 
@@ -78,42 +87,6 @@ A single-user, local-first quant research project that:
 
 ---
 
-## Setup / How to run
-
-> Run commands from the project root with your venv active.
-
-### Data download + cache
-
-```bash
-python3 -m src.data.download_prices
-python3 -m src.data.inspect_cache
-```
-
-### Risk Engines (baselines)
-
-```bash
-python3 -m src.experiments.run_trend_vol
-python3 -m src.experiments.run_risk_parity
-```
-
-### LSTM Pipeline
-
-```bash
-python3 -m src.experiments.run_make_dataset
-python3 -m src.experiments.run_build_lstm_dataset
-python3 -m src.experiments.run_lstm_train
-python3 -m src.experiments.run_lstm_eval_ic
-python3 -m src.experiments.run_lstm_topn_backtest
-```
-
-### Walk-forward (annual retraining + OOS testing)
-
-```bash
-python3 -m src.experiments.run_walk_forward
-```
-
----
-
 ## Current state of the project
 
 Implemented so far:
@@ -121,7 +94,7 @@ Implemented so far:
 - Local data pipeline + Parquet caching
 - Backtest engine with costs + turnover + exposure stats
 - Trend/vol-target risk engine baseline(s)
-- Risk parity-style baseline
+- Inverse-volatility baseline
 - LSTM alpha training + IC evaluation
 - LSTM Top-N strategy with:
   - buffer/hysteresis
@@ -130,6 +103,39 @@ Implemented so far:
   - benchmark + risk-matched comparisons
 - Walk-forward evaluation across multiple years (annual refits)
 
+## Research integrity (anti-lookahead + realism)
+- **No lookahead execution:** targets are applied **T+1** (rebalance signals shifted by 1 trading day).
+- **Transaction costs:** bps cost model applied on turnover.
+- **Walk-forward:** model is retrained each year using only past data (train/val → test year).
+- **Turnover controls:** buffer/hysteresis keeps names unless rank deteriorates past `N + buffer`.
+
 ## Practical Notes
 
-- Training on Apple Silicon can hit memory limits depending on batch size + dataset size.
+- Training on Apple Silicon can hit memory limits depending on batch size + dataset size, if so:
+  - reduce `batch` size in training,
+  - reduce universe size,
+  - or force CPU training.
+
+----------------------------------
+
+## Quickstart
+> Run commands from the project root with your venv active.
+
+### Requirements
+- Python 3.11+ (tested on 3.12)
+- Key libs: pandas, numpy, torch, yfinance, matplotlib
+
+### Download + cache data
+
+```bash
+python3 -m src.data.download_prices
+```
+
+### Main strategy (Walk-forward OOS)
+
+```bash
+python3 -m src.experiments.run_walk_forward
+```
+
+Outputs saved to: `reports/walk_forward_<timestamp>/` (equity PNG/CSV + summary CSVs)
+
