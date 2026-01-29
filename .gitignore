@@ -1,0 +1,48 @@
+# virtual envs
+.venv/
+.venv_test/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Data + artifacts (DON'T commit)
+data/
+reports/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.parquet
+*.feather
+*.h5
+*.hdf5
+
+# Editors
+.vscode/
+.idea/
+
+# logs
+*.log
+
+# keys
+*.pem
+*.key
