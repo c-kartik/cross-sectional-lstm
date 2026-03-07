@@ -130,6 +130,7 @@ Outputs a shareable HTML report at:
 `reports/walk_forward/run_YYYYMMDD_HHMMSS/report.html`
 Each run now also writes `run_manifest.json` with config, git commit/dirty state,
 runtime metadata, seeds, and input data fingerprint.
+Profiling artifacts are also saved as `profiling_summary.csv` and `profiling_stages.png`.
 
 ### Experimental optimization layer (R&D only)
 
@@ -149,6 +150,7 @@ Reports:
 - `reports/lstm_optimize/run_YYYYMMDD_HHMMSS/report.html`
 - `reports/lstm_optimize_grid/run_YYYYMMDD_HHMMSS/grid_summary.csv`
 - `run_manifest.json` in each run folder for reproducibility/provenance
+- `profiling_summary.csv` + `profiling_stages.png` in each run folder
 
 ### Tests
 

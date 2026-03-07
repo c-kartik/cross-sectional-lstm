@@ -18,6 +18,7 @@ from src.optimize.mean_variance import MVConfig, mean_variance_weights
 from src.reporting.optimizer_report import generate_optimizer_report
 from src.signals.trend import above_sma
 from src.universe.custom import get_universe
+from src.utils.profiling import RunProfiler
 from src.utils.run_manifest import write_run_manifest
 
 TRADING_DAYS = 252
@@ -61,24 +62,26 @@ def load_lstm_scores_test(df_feat_label: pd.DataFrame, cfg: DatasetConfig) -> pd
 
 if __name__ == "__main__":
     print("[experimental] Running LSTM + optimizer R&D workflow (not headline baseline).")
+    profiler = RunProfiler("run_lstm_optimize_portfolio")
     # ------------------------
     # Data
     # ------------------------
-    prices = load_prices()
-    price_col = "adj_close" if "adj_close" in prices.columns else "close"
-    px_all = prices[price_col].unstack("ticker").sort_index()
-    rets_all = compute_returns(prices, price_col=price_col).unstack("ticker").sort_index()
+    with profiler.stage("load_data"):
+        prices = load_prices()
+        price_col = "adj_close" if "adj_close" in prices.columns else "close"
+        px_all = prices[price_col].unstack("ticker").sort_index()
+        rets_all = compute_returns(prices, price_col=price_col).unstack("ticker").sort_index()
 
-    universe = [t for t in get_universe() if t in px_all.columns]
-    px = px_all[universe].dropna(how="all")
+        universe = [t for t in get_universe() if t in px_all.columns]
+        px = px_all[universe].dropna(how="all")
 
-    # Build features table (same as before)
-    Xtab = build_features(px)
-    df_feat = Xtab.copy()
-    df_feat["fwd_ret_5d"] = 0.0  # dummy label for sequences
-    cfg = DatasetConfig(seq_len=60, label_col="fwd_ret_5d")
-
-    pred_df = load_lstm_scores_test(df_feat, cfg)
+    with profiler.stage("build_features_and_predictions"):
+        # Build features table (same as before)
+        Xtab = build_features(px)
+        df_feat = Xtab.copy()
+        df_feat["fwd_ret_5d"] = 0.0  # dummy label for sequences
+        cfg = DatasetConfig(seq_len=60, label_col="fwd_ret_5d")
+        pred_df = load_lstm_scores_test(df_feat, cfg)
 
     trade_tickers = [t for t in universe if t not in ("SPY", "QQQ")]
 
@@ -127,123 +130,126 @@ if __name__ == "__main__":
     w_base = pd.DataFrame(np.nan, index=px_all.loc[start_dt:end_dt].index, columns=trade_tickers)
     current_holdings: set[str] = set()
 
-    for dt in rebals:
-        if dt not in w.index:
-            prev = w.index[w.index <= dt]
-            if len(prev) == 0:
+    with profiler.stage("build_portfolios"):
+        for dt in rebals:
+            if dt not in w.index:
+                prev = w.index[w.index <= dt]
+                if len(prev) == 0:
+                    continue
+                dt = prev[-1]
+
+            if not bool(spy_ok.loc[dt]):
+                w.loc[dt] = 0.0
+                prev_w = pd.Series(0.0, index=trade_tickers)
+                w_base.loc[dt] = 0.0
+                current_holdings = set()
                 continue
-            dt = prev[-1]
 
-        if not bool(spy_ok.loc[dt]):
-            w.loc[dt] = 0.0
-            prev_w = pd.Series(0.0, index=trade_tickers)
-            w_base.loc[dt] = 0.0
-            current_holdings = set()
-            continue
+            preds_today = pred_df.xs(dt, level="date")["pred"].reindex(trade_tickers).fillna(0.0)
 
-        preds_today = pred_df.xs(dt, level="date")["pred"].reindex(trade_tickers).fillna(0.0)
-
-        # ----- baseline top-N with buffer -----
-        ranks = preds_today.rank(ascending=False, method="first")
-        sell_cutoff = top_n + buffer_k
-        to_keep = {t for t in current_holdings if (t in ranks.index and ranks.loc[t] <= sell_cutoff)}
-        topN = ranks[ranks <= top_n].sort_values().index.tolist()
-        new_holdings = set(to_keep)
-        for t in topN:
-            if len(new_holdings) >= top_n:
-                break
-            new_holdings.add(t)
-        if len(new_holdings) < top_n:
-            for t in ranks.sort_values().index.tolist():
+            # ----- baseline top-N with buffer -----
+            ranks = preds_today.rank(ascending=False, method="first")
+            sell_cutoff = top_n + buffer_k
+            to_keep = {t for t in current_holdings if (t in ranks.index and ranks.loc[t] <= sell_cutoff)}
+            topN = ranks[ranks <= top_n].sort_values().index.tolist()
+            new_holdings = set(to_keep)
+            for t in topN:
                 if len(new_holdings) >= top_n:
                     break
                 new_holdings.add(t)
-        current_holdings = new_holdings
+            if len(new_holdings) < top_n:
+                for t in ranks.sort_values().index.tolist():
+                    if len(new_holdings) >= top_n:
+                        break
+                    new_holdings.add(t)
+            current_holdings = new_holdings
 
-        hold_list = list(current_holdings)
-        scores = preds_today.reindex(hold_list)
-        r = scores.rank(ascending=False, method="first")
-        raw = (len(hold_list) + 1 - r).astype(float).clip(lower=0.0)
-        base = pd.Series(0.0, index=trade_tickers)
-        if raw.sum() > 0:
-            base.loc[hold_list] = (raw / raw.sum()).values
-        else:
-            base.loc[hold_list] = 1.0 / max(len(hold_list), 1)
+            hold_list = list(current_holdings)
+            scores = preds_today.reindex(hold_list)
+            r = scores.rank(ascending=False, method="first")
+            raw = (len(hold_list) + 1 - r).astype(float).clip(lower=0.0)
+            base = pd.Series(0.0, index=trade_tickers)
+            if raw.sum() > 0:
+                base.loc[hold_list] = (raw / raw.sum()).values
+            else:
+                base.loc[hold_list] = 1.0 / max(len(hold_list), 1)
 
-        hist = rets_all.loc[:dt, trade_tickers].dropna(how="all")
-        if len(hist) >= vol_lookback + 1:
-            hist_window = hist.tail(vol_lookback)
-            port_hist = (hist_window.fillna(0.0) * base).sum(axis=1)
+            hist = rets_all.loc[:dt, trade_tickers].dropna(how="all")
+            if len(hist) >= vol_lookback + 1:
+                hist_window = hist.tail(vol_lookback)
+                port_hist = (hist_window.fillna(0.0) * base).sum(axis=1)
+                vol_daily = float(port_hist.std(ddof=0))
+                target_daily = target_vol_annual / np.sqrt(252)
+                lev = min(max_leverage, target_daily / vol_daily) if vol_daily > 0 else 1.0
+            else:
+                lev = 1.0
+            w_base.loc[dt] = base * lev
+
+            # ----- optimizer weights (restricted to top-K by alpha) -----
+            opt_names = ranks.sort_values().index.tolist()[:opt_top_k]
+            top_names = ranks[ranks <= top_n].sort_values().index.tolist()
+            hist = rets_all.loc[:dt, opt_names].dropna(how="all")
+            if len(hist) < vol_lookback + 1:
+                continue
+
+            hist_window = hist.tail(vol_lookback).fillna(0.0)
+            cov = hist_window.cov().values
+            alpha = preds_today.reindex(opt_names).values
+
+            prev_sub = prev_w.reindex(opt_names).fillna(0.0).values
+            top_mask = np.array([t in top_names for t in opt_names], dtype=bool)
+            weights = mean_variance_weights(alpha, cov, w_prev=prev_sub, top_mask=top_mask, cfg=mv_cfg)
+            base = pd.Series(0.0, index=trade_tickers)
+            base.loc[opt_names] = weights
+
+            port_hist = (hist_window * base).sum(axis=1)
             vol_daily = float(port_hist.std(ddof=0))
             target_daily = target_vol_annual / np.sqrt(252)
             lev = min(max_leverage, target_daily / vol_daily) if vol_daily > 0 else 1.0
-        else:
-            lev = 1.0
-        w_base.loc[dt] = base * lev
 
-        # ----- optimizer weights (restricted to top-K by alpha) -----
-        opt_names = ranks.sort_values().index.tolist()[:opt_top_k]
-        top_names = ranks[ranks <= top_n].sort_values().index.tolist()
-        hist = rets_all.loc[:dt, opt_names].dropna(how="all")
-        if len(hist) < vol_lookback + 1:
-            continue
+            w.loc[dt] = base * lev
+            prev_w = w.loc[dt].fillna(0.0)
 
-        hist_window = hist.tail(vol_lookback).fillna(0.0)
-        cov = hist_window.cov().values
-        alpha = preds_today.reindex(opt_names).values
+    with profiler.stage("backtest"):
+        rets_test = rets_all.loc[w.index, trade_tickers]
+        targets = w[trade_tickers].shift(1)
+        result = run_backtest(rets_test, targets, cost_bps=cost_bps)
 
-        prev_sub = prev_w.reindex(opt_names).fillna(0.0).values
-        top_mask = np.array([t in top_names for t in opt_names], dtype=bool)
-        weights = mean_variance_weights(alpha, cov, w_prev=prev_sub, top_mask=top_mask, cfg=mv_cfg)
-        base = pd.Series(0.0, index=trade_tickers)
-        base.loc[opt_names] = weights
+        rets_test_base = rets_all.loc[w_base.index, trade_tickers]
+        targets_base = w_base[trade_tickers].shift(1)
+        result_base = run_backtest(rets_test_base, targets_base, cost_bps=cost_bps)
 
-        port_hist = (hist_window * base).sum(axis=1)
-        vol_daily = float(port_hist.std(ddof=0))
-        target_daily = target_vol_annual / np.sqrt(252)
-        lev = min(max_leverage, target_daily / vol_daily) if vol_daily > 0 else 1.0
-
-        w.loc[dt] = base * lev
-        prev_w = w.loc[dt].fillna(0.0)
-
-    rets_test = rets_all.loc[w.index, trade_tickers]
-    targets = w[trade_tickers].shift(1)
-    result = run_backtest(rets_test, targets, cost_bps=cost_bps)
-
-    rets_test_base = rets_all.loc[w_base.index, trade_tickers]
-    targets_base = w_base[trade_tickers].shift(1)
-    result_base = run_backtest(rets_test_base, targets_base, cost_bps=cost_bps)
-
-    # Benchmark equity (same dates as optimizer)
-    qqq_eq = (1.0 + rets_all["QQQ"].loc[w.index].fillna(0.0)).cumprod()
-    spy_eq = (1.0 + rets_all["SPY"].loc[w.index].fillna(0.0)).cumprod()
+        # Benchmark equity (same dates as optimizer)
+        qqq_eq = (1.0 + rets_all["QQQ"].loc[w.index].fillna(0.0)).cumprod()
+        spy_eq = (1.0 + rets_all["SPY"].loc[w.index].fillna(0.0)).cumprod()
 
     run_id = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
     run_dir = Path("reports") / "lstm_optimize" / f"run_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    eq = result["equity"]
-    eq.to_csv(run_dir / "equity.csv", header=True)
-    plt.figure()
-    eq.plot(title="LSTM + Mean-Variance Optimized Equity")
-    plt.xlabel("Date")
-    plt.ylabel("Equity (start=1.0)")
-    plt.tight_layout()
-    plt.savefig(run_dir / "equity.png", dpi=150)
-    plt.close()
+    with profiler.stage("write_outputs"):
+        eq = result["equity"]
+        eq.to_csv(run_dir / "equity.csv", header=True)
+        plt.figure()
+        eq.plot(title="LSTM + Mean-Variance Optimized Equity")
+        plt.xlabel("Date")
+        plt.ylabel("Equity (start=1.0)")
+        plt.tight_layout()
+        plt.savefig(run_dir / "equity.png", dpi=150)
+        plt.close()
 
-    eq_base = result_base["equity"]
-    eq_base.to_csv(run_dir / "equity_baseline.csv", header=True)
-    plt.figure()
-    eq_base.plot(title="LSTM Top-N Baseline Equity")
-    plt.xlabel("Date")
-    plt.ylabel("Equity (start=1.0)")
-    plt.tight_layout()
-    plt.savefig(run_dir / "equity_baseline.png", dpi=150)
-    plt.close()
+        eq_base = result_base["equity"]
+        eq_base.to_csv(run_dir / "equity_baseline.csv", header=True)
+        plt.figure()
+        eq_base.plot(title="LSTM Top-N Baseline Equity")
+        plt.xlabel("Date")
+        plt.ylabel("Equity (start=1.0)")
+        plt.tight_layout()
+        plt.savefig(run_dir / "equity_baseline.png", dpi=150)
+        plt.close()
 
-    qqq_eq.to_csv(run_dir / "equity_qqq.csv", header=True)
-    spy_eq.to_csv(run_dir / "equity_spy.csv", header=True)
+        qqq_eq.to_csv(run_dir / "equity_qqq.csv", header=True)
+        spy_eq.to_csv(run_dir / "equity_spy.csv", header=True)
 
     summary = {
         "risk_aversion": mv_cfg.risk_aversion,
@@ -282,4 +288,7 @@ if __name__ == "__main__":
     print(f"Saved run manifest to: {manifest_path}")
     report_path = generate_optimizer_report(run_dir)
     print(f"Saved optimizer HTML report to: {report_path}")
+    csv_path, png_path = profiler.write_artifacts(run_dir)
+    print(f"Saved profiling summary to: {csv_path}")
+    print(f"Saved profiling chart to: {png_path}")
     print(f"Saved optimized run to: {run_dir}")

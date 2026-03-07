@@ -25,6 +25,7 @@ def generate_optimizer_report(run_dir: Path) -> Path:
     stats_base_path = run_dir / "stats_baseline.json"
     turnover = _read_csv(run_dir / "turnover.csv")
     turnover_base = _read_csv(run_dir / "turnover_baseline.csv")
+    profiling_img = run_dir / "profiling_stages.png"
 
     # Relative performance chart
     rel_img = ""
@@ -222,6 +223,11 @@ def generate_optimizer_report(run_dir: Path) -> Path:
       <h2>Relative Performance</h2>
       <div class="grid">
         {rel_img or '<p class="muted">(relative chart not available)</p>'}
+      </div>
+
+      <h2>Profiling</h2>
+      <div class="grid">
+        {f'<div class="img"><img src="{profiling_img.name}" alt="{profiling_img.name}"></div>' if profiling_img.exists() else '<p class="muted">(profiling chart not available)</p>'}
       </div>
     </body>
     </html>

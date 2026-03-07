@@ -16,6 +16,7 @@ from src.models.lstm import LSTMRegressor
 from src.signals.trend import above_sma
 from src.backtest.engine import run_backtest
 from src.reporting.walk_forward_report import generate_walk_forward_report
+from src.utils.profiling import RunProfiler
 from src.utils.run_manifest import write_run_manifest
 import torch
 
@@ -119,27 +120,30 @@ def predict_lstm(Xte: np.ndarray, ckpt_path: str, n_features: int) -> np.ndarray
 
 
 if __name__ == "__main__":
+    profiler = RunProfiler("run_walk_forward")
     # ------------------------
     # Build full data table once
     # ------------------------
-    prices = load_prices()
-    price_col = "adj_close" if "adj_close" in prices.columns else "close"
-    px_all = prices[price_col].unstack("ticker").sort_index()
-    rets_all = compute_returns(prices, price_col=price_col).unstack("ticker").sort_index()
+    with profiler.stage("load_data"):
+        prices = load_prices()
+        price_col = "adj_close" if "adj_close" in prices.columns else "close"
+        px_all = prices[price_col].unstack("ticker").sort_index()
+        rets_all = compute_returns(prices, price_col=price_col).unstack("ticker").sort_index()
 
     universe = [t for t in get_universe() if t in px_all.columns]
     trade_tickers = [t for t in universe if t not in ("SPY", "QQQ")]
 
     # Build features (MultiIndex: date, ticker)
-    Xtab = build_features(px_all[universe].dropna(how="all"))
-    # Build REAL labels from price levels
-    label_col = "fwd_ret_5d"
-    labels = make_fwd_return_label(px_all[universe], horizon=5)
-    # Merge label into feature table
-    Xtab = Xtab.join(labels, how="left")
-    # Drop rows without label (last 5 days for each ticker will be NaN)
-    Xtab = Xtab.dropna(subset=[label_col])
-    cfg = DatasetConfig(seq_len=60, label_col=label_col)
+    with profiler.stage("build_features_labels"):
+        Xtab = build_features(px_all[universe].dropna(how="all"))
+        # Build REAL labels from price levels
+        label_col = "fwd_ret_5d"
+        labels = make_fwd_return_label(px_all[universe], horizon=5)
+        # Merge label into feature table
+        Xtab = Xtab.join(labels, how="left")
+        # Drop rows without label (last 5 days for each ticker will be NaN)
+        Xtab = Xtab.dropna(subset=[label_col])
+        cfg = DatasetConfig(seq_len=60, label_col=label_col)
     
     # ------------------------
     # Run output directory
@@ -184,205 +188,205 @@ if __name__ == "__main__":
     seeds = [2, 4, 6]
     
     rows = []
+    with profiler.stage("walk_forward_loop"):
+        for seed in seeds:
+            print(f"\n====================")
+            print(f"SEED = {seed}")
+            print(f"====================")
 
-    for seed in seeds:
-        print(f"\n====================")
-        print(f"SEED = {seed}")
-        print(f"====================")
+            for yr in test_years:
+                # deterministic per seed+year
+                run_seed = seed * 10_000 + yr
+                set_seed(run_seed)
+                
+                test_start = pd.Timestamp(f"{yr}-01-01")
+                test_end = pd.Timestamp(f"{yr}-12-31")
 
-        for yr in test_years:
-            # deterministic per seed+year
-            run_seed = seed * 10_000 + yr
-            set_seed(run_seed)
-            
-            test_start = pd.Timestamp(f"{yr}-01-01")
-            test_end = pd.Timestamp(f"{yr}-12-31")
+                # Train/val end right before test starts
+                train_end = test_start - pd.Timedelta(days=1)
+                val_start = train_end - pd.Timedelta(days=365)  # last year as validation
+                train_start = dates.min()
 
-            # Train/val end right before test starts
-            train_end = test_start - pd.Timedelta(days=1)
-            val_start = train_end - pd.Timedelta(days=365)  # last year as validation
-            train_start = dates.min()
+                # Build sequences for train/val/test
+                Xtr, ytr, _ = make_sequences(Xtab, cfg, dates_keep=(train_start, val_start - pd.Timedelta(days=1)))
+                Xva, yva, _ = make_sequences(Xtab, cfg, dates_keep=(val_start, train_end))
+                Xte, yte, keys_te = make_sequences(Xtab, cfg, dates_keep=(test_start, test_end))
 
-            # Build sequences for train/val/test
-            Xtr, ytr, _ = make_sequences(Xtab, cfg, dates_keep=(train_start, val_start - pd.Timedelta(days=1)))
-            Xva, yva, _ = make_sequences(Xtab, cfg, dates_keep=(val_start, train_end))
-            Xte, yte, keys_te = make_sequences(Xtab, cfg, dates_keep=(test_start, test_end))
+                if len(Xte) == 0 or len(Xtr) == 0 or len(Xva) == 0:
+                    print("Skipping", yr, "due to insufficient data.")
+                    continue
 
-            if len(Xte) == 0 or len(Xtr) == 0 or len(Xva) == 0:
-                print("Skipping", yr, "due to insufficient data.")
-                continue
+                ckpt = ckpt_dir / f"lstm_best_seed{seed}_{yr}.pt"
+                train_lstm(Xtr, ytr, Xva, yva, ckpt_path=str(ckpt))
 
-            ckpt = ckpt_dir / f"lstm_best_seed{seed}_{yr}.pt"
-            train_lstm(Xtr, ytr, Xva, yva, ckpt_path=str(ckpt))
+                preds = predict_lstm(Xte, ckpt_path=str(ckpt), n_features=Xte.shape[-1])
+                pred_df = pd.DataFrame(
+                    {"pred": preds},
+                    index=pd.MultiIndex.from_tuples(keys_te, names=["date", "ticker"]),
+                ).sort_index()
 
-            preds = predict_lstm(Xte, ckpt_path=str(ckpt), n_features=Xte.shape[-1])
-            pred_df = pd.DataFrame(
-                {"pred": preds},
-                index=pd.MultiIndex.from_tuples(keys_te, names=["date", "ticker"]),
-            ).sort_index()
+                # ------------------------
+                # Portfolio construction (Top-N + buffer + sticky rebalances)
+                # ------------------------
+                top_n = 15
+                buffer_k = 10
+                target_vol_annual = 0.25
+                vol_lookback = 60
+                max_leverage = 2.0
+                cost_bps = 10.0
+                sma_window_regime = 100
 
-            # ------------------------
-            # Portfolio construction (Top-N + buffer + sticky rebalances)
-            # ------------------------
-            top_n = 15
-            buffer_k = 10
-            target_vol_annual = 0.25
-            vol_lookback = 60
-            max_leverage = 2.0
-            cost_bps = 10.0
-            sma_window_regime = 100
+                idx = pred_df.index.get_level_values("date").unique().sort_values()
+                if len(idx) == 0:
+                    continue
 
-            idx = pred_df.index.get_level_values("date").unique().sort_values()
-            if len(idx) == 0:
-                continue
+                start_dt, end_dt = idx.min(), idx.max()
 
-            start_dt, end_dt = idx.min(), idx.max()
-
-            # SPY regime
-            if "SPY" in px_all.columns:
-                spy_ok = above_sma(px_all[["SPY"]], window=sma_window_regime)["SPY"]
-            else:
-                spy_ok = pd.Series(True, index=px_all.index)
-
-            rebals = weekly_rebalance_dates(px_all.loc[start_dt:end_dt].index)
-            w = pd.DataFrame(np.nan, index=px_all.loc[start_dt:end_dt].index, columns=trade_tickers)
-
-            current_holdings: set[str] = set()
-
-            test_dates = pred_df.index.get_level_values("date").unique().sort_values()
-
-            for dt in rebals:
-                if dt not in w.index:
-                    prev = w.index[w.index <= dt]
-                    if len(prev) == 0:
-                        continue
-                    dt = prev[-1]
-
-                if dt not in test_dates:
-                    prev_pred = test_dates[test_dates <= dt]
-                    if len(prev_pred) == 0:
-                        continue
-                    dt_pred = prev_pred[-1]
+                # SPY regime
+                if "SPY" in px_all.columns:
+                    spy_ok = above_sma(px_all[["SPY"]], window=sma_window_regime)["SPY"]
                 else:
-                    dt_pred = dt
+                    spy_ok = pd.Series(True, index=px_all.index)
 
-                if not bool(spy_ok.loc[dt]):
-                    w.loc[dt] = 0.0
-                    current_holdings = set()
-                    continue
+                rebals = weekly_rebalance_dates(px_all.loc[start_dt:end_dt].index)
+                w = pd.DataFrame(np.nan, index=px_all.loc[start_dt:end_dt].index, columns=trade_tickers)
 
-                preds_today = pred_df.xs(dt_pred, level="date")["pred"]
-                preds_today = preds_today.reindex(trade_tickers).dropna()
-                if len(preds_today) < top_n:
-                    w.loc[dt] = 0.0
-                    current_holdings = set()
-                    continue
+                current_holdings: set[str] = set()
 
-                ranks = preds_today.rank(ascending=False, method="first")
-                sell_cutoff = top_n + buffer_k
-                to_keep = {t for t in current_holdings if (t in ranks.index and ranks.loc[t] <= sell_cutoff)}
-                topN = ranks[ranks <= top_n].sort_values().index.tolist()
+                test_dates = pred_df.index.get_level_values("date").unique().sort_values()
 
-                new_holdings = set(to_keep)
-                for t in topN:
-                    if len(new_holdings) >= top_n:
-                        break
-                    new_holdings.add(t)
+                for dt in rebals:
+                    if dt not in w.index:
+                        prev = w.index[w.index <= dt]
+                        if len(prev) == 0:
+                            continue
+                        dt = prev[-1]
 
-                if len(new_holdings) < top_n:
-                    for t in ranks.sort_values().index.tolist():
+                    if dt not in test_dates:
+                        prev_pred = test_dates[test_dates <= dt]
+                        if len(prev_pred) == 0:
+                            continue
+                        dt_pred = prev_pred[-1]
+                    else:
+                        dt_pred = dt
+
+                    if not bool(spy_ok.loc[dt]):
+                        w.loc[dt] = 0.0
+                        current_holdings = set()
+                        continue
+
+                    preds_today = pred_df.xs(dt_pred, level="date")["pred"]
+                    preds_today = preds_today.reindex(trade_tickers).dropna()
+                    if len(preds_today) < top_n:
+                        w.loc[dt] = 0.0
+                        current_holdings = set()
+                        continue
+
+                    ranks = preds_today.rank(ascending=False, method="first")
+                    sell_cutoff = top_n + buffer_k
+                    to_keep = {t for t in current_holdings if (t in ranks.index and ranks.loc[t] <= sell_cutoff)}
+                    topN = ranks[ranks <= top_n].sort_values().index.tolist()
+
+                    new_holdings = set(to_keep)
+                    for t in topN:
                         if len(new_holdings) >= top_n:
                             break
                         new_holdings.add(t)
 
-                holdings_changed = (new_holdings != current_holdings)
-                current_holdings = new_holdings
-                if not holdings_changed:
-                    continue
+                    if len(new_holdings) < top_n:
+                        for t in ranks.sort_values().index.tolist():
+                            if len(new_holdings) >= top_n:
+                                break
+                            new_holdings.add(t)
 
-                # rank-weight base
-                hold_list = list(current_holdings)
-                scores = preds_today.reindex(hold_list)
-                r = scores.rank(ascending=False, method="first")
-                raw = (len(hold_list) + 1 - r).astype(float).clip(lower=0.0)
+                    holdings_changed = (new_holdings != current_holdings)
+                    current_holdings = new_holdings
+                    if not holdings_changed:
+                        continue
 
-                base = pd.Series(0.0, index=trade_tickers)
-                base.loc[hold_list] = (raw / raw.sum()).values
+                    # rank-weight base
+                    hold_list = list(current_holdings)
+                    scores = preds_today.reindex(hold_list)
+                    r = scores.rank(ascending=False, method="first")
+                    raw = (len(hold_list) + 1 - r).astype(float).clip(lower=0.0)
 
-                hist = rets_all.loc[:dt, trade_tickers].dropna(how="all")
-                if len(hist) >= vol_lookback + 1:
-                    hist_window = hist.tail(vol_lookback)
-                    port_hist = (hist_window.fillna(0.0) * base).sum(axis=1)
-                    vol_daily = float(port_hist.std(ddof=0))
-                    target_daily = target_vol_annual / np.sqrt(252)
-                    lev = min(max_leverage, target_daily / vol_daily) if vol_daily > 0 else 1.0
-                else:
-                    lev = 1.0
+                    base = pd.Series(0.0, index=trade_tickers)
+                    base.loc[hold_list] = (raw / raw.sum()).values
 
-                w.loc[dt] = base * lev
+                    hist = rets_all.loc[:dt, trade_tickers].dropna(how="all")
+                    if len(hist) >= vol_lookback + 1:
+                        hist_window = hist.tail(vol_lookback)
+                        port_hist = (hist_window.fillna(0.0) * base).sum(axis=1)
+                        vol_daily = float(port_hist.std(ddof=0))
+                        target_daily = target_vol_annual / np.sqrt(252)
+                        lev = min(max_leverage, target_daily / vol_daily) if vol_daily > 0 else 1.0
+                    else:
+                        lev = 1.0
 
-            rets_test = rets_all.loc[w.index, trade_tickers]
+                    w.loc[dt] = base * lev
 
-            # Execute targets on the next trading day (anti-lookahead safety)
-            targets = w[trade_tickers].shift(1)
-            result = run_backtest(rets_test, targets, cost_bps=cost_bps)
+                rets_test = rets_all.loc[w.index, trade_tickers]
 
-            eq = result["equity"]
-            eq.to_csv(run_dir / f"equity_seed{seed}_{yr}.csv", header=True) # 
-            # Plot and save (per-year)
-            plt.figure()
-            eq.plot(title=f"Walk-forward Equity (Strategy) - Seed={seed} | Year={yr}")
-            plt.xlabel("Date")
-            plt.ylabel("Equity (start=1.0)")
-            plt.tight_layout()
-            plt.savefig(run_dir / f"equity_seed{seed}_{yr}.png", dpi=150)   # 
-            plt.close()
-            strat_ret = eq.pct_change().fillna(0.0)
+                # Execute targets on the next trading day (anti-lookahead safety)
+                targets = w[trade_tickers].shift(1)
+                result = run_backtest(rets_test, targets, cost_bps=cost_bps)
 
-            qqq_eq = (1.0 + rets_all["QQQ"].loc[w.index].fillna(0.0)).cumprod()
-            qqq_ret = qqq_eq.pct_change().fillna(0.0)
+                eq = result["equity"]
+                eq.to_csv(run_dir / f"equity_seed{seed}_{yr}.csv", header=True)
+                # Plot and save (per-year)
+                plt.figure()
+                eq.plot(title=f"Walk-forward Equity (Strategy) - Seed={seed} | Year={yr}")
+                plt.xlabel("Date")
+                plt.ylabel("Equity (start=1.0)")
+                plt.tight_layout()
+                plt.savefig(run_dir / f"equity_seed{seed}_{yr}.png", dpi=150)
+                plt.close()
+                strat_ret = eq.pct_change().fillna(0.0)
 
-            cagr = annualized_return_from_equity(eq)
-            vol_ann = annualized_vol_from_returns(strat_ret)
-            ir = information_ratio((strat_ret - qqq_ret).dropna())
-            
-            # Benchmark stats on the same dates
-            spy_eq = (1.0 + rets_all["SPY"].loc[w.index].fillna(0.0)).cumprod()
-            spy_ret = spy_eq.pct_change().fillna(0.0)
+                qqq_eq = (1.0 + rets_all["QQQ"].loc[w.index].fillna(0.0)).cumprod()
+                qqq_ret = qqq_eq.pct_change().fillna(0.0)
 
-            def sharpe(r: pd.Series) -> float:
-                r = r.dropna()
-                if len(r) < 2:
-                    return np.nan
-                mu = float(r.mean() * TRADING_DAYS)
-                sig = float(r.std(ddof=0) * np.sqrt(TRADING_DAYS))
-                return np.nan if sig == 0 else mu / sig
+                cagr = annualized_return_from_equity(eq)
+                vol_ann = annualized_vol_from_returns(strat_ret)
+                ir = information_ratio((strat_ret - qqq_ret).dropna())
+                
+                # Benchmark stats on the same dates
+                spy_eq = (1.0 + rets_all["SPY"].loc[w.index].fillna(0.0)).cumprod()
+                spy_ret = spy_eq.pct_change().fillna(0.0)
 
-            qqq_total = float(qqq_eq.iloc[-1] - 1.0)
-            spy_total = float(spy_eq.iloc[-1] - 1.0)
-            qqq_sh = sharpe(qqq_ret)
-            spy_sh = sharpe(spy_ret)
-            
-            s = result["stats"]
-            rows.append({
-                "seed": seed,
-                "year": yr,
-                "days": s["days"],
-                "total_return": s["total_return"],
-                "sharpe": s["sharpe"],
-                "max_dd": s["max_drawdown"],
-                "cagr": cagr,
-                "ann_vol": vol_ann,
-                "ir_vs_qqq": ir,
-                "avg_weekly_turnover": s.get("avg_weekly_turnover", np.nan),
-                "total_cost_paid": s.get("total_cost_paid", np.nan),
-                "qqq_total_return": qqq_total,
-                "qqq_sharpe": qqq_sh,
-                "spy_total_return": spy_total,
-                "spy_sharpe": spy_sh,
-            })
+                def sharpe(r: pd.Series) -> float:
+                    r = r.dropna()
+                    if len(r) < 2:
+                        return np.nan
+                    mu = float(r.mean() * TRADING_DAYS)
+                    sig = float(r.std(ddof=0) * np.sqrt(TRADING_DAYS))
+                    return np.nan if sig == 0 else mu / sig
 
-            print(f"[{yr}] StratSharpe={s['sharpe']:.3f} StratTot={s['total_return']:.3f} | "f"QQQSharpe={qqq_sh:.3f} QQQTot={qqq_total:.3f} | IRvsQQQ={ir:.3f}")
+                qqq_total = float(qqq_eq.iloc[-1] - 1.0)
+                spy_total = float(spy_eq.iloc[-1] - 1.0)
+                qqq_sh = sharpe(qqq_ret)
+                spy_sh = sharpe(spy_ret)
+                
+                s = result["stats"]
+                rows.append({
+                    "seed": seed,
+                    "year": yr,
+                    "days": s["days"],
+                    "total_return": s["total_return"],
+                    "sharpe": s["sharpe"],
+                    "max_dd": s["max_drawdown"],
+                    "cagr": cagr,
+                    "ann_vol": vol_ann,
+                    "ir_vs_qqq": ir,
+                    "avg_weekly_turnover": s.get("avg_weekly_turnover", np.nan),
+                    "total_cost_paid": s.get("total_cost_paid", np.nan),
+                    "qqq_total_return": qqq_total,
+                    "qqq_sharpe": qqq_sh,
+                    "spy_total_return": spy_total,
+                    "spy_sharpe": spy_sh,
+                })
+
+                print(f"[{yr}] StratSharpe={s['sharpe']:.3f} StratTot={s['total_return']:.3f} | "f"QQQSharpe={qqq_sh:.3f} QQQTot={qqq_total:.3f} | IRvsQQQ={ir:.3f}")
 
     out = pd.DataFrame(rows).sort_values(["year", "seed"])
     print("\nWalk-forward (seed/year) rows:")
@@ -422,18 +426,22 @@ if __name__ == "__main__":
     (run_dir / "walk_forward_summary.txt").write_text(out.to_string(index=False))
     print(f"\nSaved walk-forward artifacts to: {run_dir}")
     
-    out.to_csv(run_dir / "seed_sweep_rows.csv", index=False)
-    by_year.to_csv(run_dir / "seed_sweep_by_year.csv", index=False)
-    overall.to_csv(run_dir / "seed_sweep_overall.csv", index=False)
-    manifest_path = write_run_manifest(
-        run_dir,
-        script_name="src.experiments.run_walk_forward",
-        run_id=run_id,
-        config=config,
-        seeds=seeds,
-        input_paths=[Path("data/prices"), Path("data/datasets")],
-        extra={"test_years": test_years, "price_col": price_col, "trade_ticker_count": len(trade_tickers)},
-    )
-    print(f"Saved run manifest to: {manifest_path}")
-    report_path = generate_walk_forward_report(run_dir)
-    print(f"Saved walk-forward HTML report to: {report_path}")
+    with profiler.stage("write_outputs"):
+        out.to_csv(run_dir / "seed_sweep_rows.csv", index=False)
+        by_year.to_csv(run_dir / "seed_sweep_by_year.csv", index=False)
+        overall.to_csv(run_dir / "seed_sweep_overall.csv", index=False)
+        manifest_path = write_run_manifest(
+            run_dir,
+            script_name="src.experiments.run_walk_forward",
+            run_id=run_id,
+            config=config,
+            seeds=seeds,
+            input_paths=[Path("data/prices"), Path("data/datasets")],
+            extra={"test_years": test_years, "price_col": price_col, "trade_ticker_count": len(trade_tickers)},
+        )
+        print(f"Saved run manifest to: {manifest_path}")
+        report_path = generate_walk_forward_report(run_dir)
+        print(f"Saved walk-forward HTML report to: {report_path}")
+    csv_path, png_path = profiler.write_artifacts(run_dir)
+    print(f"Saved profiling summary to: {csv_path}")
+    print(f"Saved profiling chart to: {png_path}")

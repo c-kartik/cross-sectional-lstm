@@ -16,6 +16,7 @@ from src.models.lstm import LSTMRegressor
 from src.optimize.mean_variance import MVConfig, mean_variance_weights
 from src.signals.trend import above_sma
 from src.universe.custom import get_universe
+from src.utils.profiling import RunProfiler
 from src.utils.run_manifest import write_run_manifest
 
 
@@ -187,19 +188,22 @@ def run_optimizer_once(
 
 if __name__ == "__main__":
     print("[experimental] Running optimizer grid search for R&D only (not headline baseline).")
-    prices = load_prices()
-    price_col = "adj_close" if "adj_close" in prices.columns else "close"
-    px_all = prices[price_col].unstack("ticker").sort_index()
-    rets_all = compute_returns(prices, price_col=price_col).unstack("ticker").sort_index()
+    profiler = RunProfiler("run_lstm_optimize_grid")
+    with profiler.stage("load_data"):
+        prices = load_prices()
+        price_col = "adj_close" if "adj_close" in prices.columns else "close"
+        px_all = prices[price_col].unstack("ticker").sort_index()
+        rets_all = compute_returns(prices, price_col=price_col).unstack("ticker").sort_index()
 
     universe = [t for t in get_universe() if t in px_all.columns]
     px = px_all[universe].dropna(how="all")
 
-    Xtab = build_features(px)
-    df_feat = Xtab.copy()
-    df_feat["fwd_ret_5d"] = 0.0
-    cfg = DatasetConfig(seq_len=60, label_col="fwd_ret_5d")
-    pred_df = load_lstm_scores_test(df_feat, cfg)
+    with profiler.stage("build_features_and_predictions"):
+        Xtab = build_features(px)
+        df_feat = Xtab.copy()
+        df_feat["fwd_ret_5d"] = 0.0
+        cfg = DatasetConfig(seq_len=60, label_col="fwd_ret_5d")
+        pred_df = load_lstm_scores_test(df_feat, cfg)
 
     trade_tickers = [t for t in universe if t not in ("SPY", "QQQ")]
     spy_ok = above_sma(px_all[["SPY"]], window=100)["SPY"] if "SPY" in px_all.columns else pd.Series(True, index=px_all.index)
@@ -237,45 +241,46 @@ if __name__ == "__main__":
     ]
 
     rows = []
-    for params in grid:
-        mv_cfg = MVConfig(
-            risk_aversion=params["risk_aversion"],
-            turnover_penalty=params["turnover_penalty"],
-            max_weight=0.20,
-            long_only=True,
-            leverage=1.0,
-            alpha_scale=params["alpha_scale"],
-            cov_shrinkage=params["cov_shrinkage"],
-            min_weight_top=params["min_weight_top"],
-        )
+    with profiler.stage("grid_backtests"):
+        for params in grid:
+            mv_cfg = MVConfig(
+                risk_aversion=params["risk_aversion"],
+                turnover_penalty=params["turnover_penalty"],
+                max_weight=0.20,
+                long_only=True,
+                leverage=1.0,
+                alpha_scale=params["alpha_scale"],
+                cov_shrinkage=params["cov_shrinkage"],
+                min_weight_top=params["min_weight_top"],
+            )
 
-        w = run_optimizer_once(
-            pred_df,
-            rets_all,
-            trade_tickers,
-            spy_ok,
-            mv_cfg=mv_cfg,
-            opt_top_k=opt_top_k,
-            top_n=top_n,
-            target_vol_annual=target_vol_annual,
-            vol_lookback=vol_lookback,
-            max_leverage=max_leverage,
-        )
+            w = run_optimizer_once(
+                pred_df,
+                rets_all,
+                trade_tickers,
+                spy_ok,
+                mv_cfg=mv_cfg,
+                opt_top_k=opt_top_k,
+                top_n=top_n,
+                target_vol_annual=target_vol_annual,
+                vol_lookback=vol_lookback,
+                max_leverage=max_leverage,
+            )
 
-        rets_test = rets_all.loc[w.index, trade_tickers]
-        targets = w[trade_tickers].shift(1)
-        result = run_backtest(rets_test, targets, cost_bps=cost_bps)
+            rets_test = rets_all.loc[w.index, trade_tickers]
+            targets = w[trade_tickers].shift(1)
+            result = run_backtest(rets_test, targets, cost_bps=cost_bps)
 
-        rows.append(
-            {
-                **params,
-                "total_return": result["stats"]["total_return"],
-                "sharpe": result["stats"]["sharpe"],
-                "max_drawdown": result["stats"]["max_drawdown"],
-                "return_diff_vs_base": result["stats"]["total_return"] - result_base["stats"]["total_return"],
-                "sharpe_diff_vs_base": result["stats"]["sharpe"] - result_base["stats"]["sharpe"],
-            }
-        )
+            rows.append(
+                {
+                    **params,
+                    "total_return": result["stats"]["total_return"],
+                    "sharpe": result["stats"]["sharpe"],
+                    "max_drawdown": result["stats"]["max_drawdown"],
+                    "return_diff_vs_base": result["stats"]["total_return"] - result_base["stats"]["total_return"],
+                    "sharpe_diff_vs_base": result["stats"]["sharpe"] - result_base["stats"]["sharpe"],
+                }
+            )
 
     out = pd.DataFrame(rows).sort_values("return_diff_vs_base", ascending=False)
 
@@ -303,6 +308,9 @@ if __name__ == "__main__":
         input_paths=[Path("data/prices"), Path("data/datasets/lstm_best.pt")],
         extra={"price_col": price_col, "universe_count": len(universe), "trade_ticker_count": len(trade_tickers)},
     )
+    csv_path, png_path = profiler.write_artifacts(run_dir)
 
     print(f"Saved grid summary to: {run_dir / 'grid_summary.csv'}")
     print(f"Saved run manifest to: {manifest_path}")
+    print(f"Saved profiling summary to: {csv_path}")
+    print(f"Saved profiling chart to: {png_path}")

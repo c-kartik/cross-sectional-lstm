@@ -22,6 +22,7 @@ def generate_walk_forward_report(run_dir: Path) -> Path:
     config_path = run_dir / "config.json"
 
     equity_imgs = sorted(run_dir.glob("equity_seed*_*.png"))
+    profiling_img = run_dir / "profiling_stages.png"
 
     drawdown_imgs: list[Path] = []
     equity_csvs = sorted(run_dir.glob("equity_seed*_*.csv"))
@@ -138,6 +139,9 @@ def generate_walk_forward_report(run_dir: Path) -> Path:
 
       <h2>Additional Charts</h2>
       {extra_html or '<p class="muted">(no additional charts generated)</p>'}
+
+      <h2>Profiling</h2>
+      {f'<p><img src="{profiling_img.name}" alt="{profiling_img.name}" style="max-width:100%;"></p>' if profiling_img.exists() else '<p class="muted">(no profiling chart found)</p>'}
     </body>
     </html>
     """
