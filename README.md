@@ -122,16 +122,23 @@ Use the Top-N baseline as the primary portfolio construction layer:
 
 ```bash
 python3 -m src.experiments.run_walk_forward
+# or
+make run-walkforward
 ```
 
 Outputs a shareable HTML report at:
 `reports/walk_forward/run_YYYYMMDD_HHMMSS/report.html`
+Each run now also writes `run_manifest.json` with config, git commit/dirty state,
+runtime metadata, seeds, and input data fingerprint.
 
 ### Experimental optimization layer (R&D only)
 
 ```bash
 python3 -m src.experiments.run_lstm_optimize_portfolio
 python3 -m src.experiments.run_lstm_optimize_grid
+# or
+make run-opt-rd
+make run-opt-grid
 ```
 
 This optimizer path is kept for research and skill demonstration. It is
@@ -141,14 +148,27 @@ more robust in recent runs.
 Reports:
 - `reports/lstm_optimize/run_YYYYMMDD_HHMMSS/report.html`
 - `reports/lstm_optimize_grid/run_YYYYMMDD_HHMMSS/grid_summary.csv`
+- `run_manifest.json` in each run folder for reproducibility/provenance
 
 ### Tests
 
 ```bash
 pytest -q
+# or
+make test
 ```
 
 CI runs this test suite automatically on push/PR via GitHub Actions.
+
+### Reproducibility controls
+
+- All main experiments emit `run_manifest.json` with:
+  - script name + run ID + UTC timestamp
+  - git commit hash + branch + tracked-dirty flag
+  - runtime context (Python/platform/cwd)
+  - seeds/config used for the run
+  - fingerprint of input data/model paths
+- One-command wrappers are provided in `Makefile` for common workflows.
 
 ---
 ## Current state of the project

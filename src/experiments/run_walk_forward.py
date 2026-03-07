@@ -16,6 +16,7 @@ from src.models.lstm import LSTMRegressor
 from src.signals.trend import above_sma
 from src.backtest.engine import run_backtest
 from src.reporting.walk_forward_report import generate_walk_forward_report
+from src.utils.run_manifest import write_run_manifest
 import torch
 
 TRADING_DAYS = 252
@@ -159,7 +160,7 @@ if __name__ == "__main__":
     
     # Making the run reproducible
     config = {
-        "test_years": [2025, 2024, 2023, 2022],
+        "test_years": [2022, 2023, 2024, 2025],
         "seq_len": 60,
         "label_horizon_days": 5,
         "top_n": 15,
@@ -179,7 +180,7 @@ if __name__ == "__main__":
     # Walk-forward splits
     # Example: test years 2022, 2023, 2024, 2025 (adjust based on your data)
     # ------------------------
-    test_years = [2022, 2023, 2024, 2025]
+    test_years = config["test_years"]
     seeds = [2, 4, 6]
     
     rows = []
@@ -424,5 +425,15 @@ if __name__ == "__main__":
     out.to_csv(run_dir / "seed_sweep_rows.csv", index=False)
     by_year.to_csv(run_dir / "seed_sweep_by_year.csv", index=False)
     overall.to_csv(run_dir / "seed_sweep_overall.csv", index=False)
+    manifest_path = write_run_manifest(
+        run_dir,
+        script_name="src.experiments.run_walk_forward",
+        run_id=run_id,
+        config=config,
+        seeds=seeds,
+        input_paths=[Path("data/prices"), Path("data/datasets")],
+        extra={"test_years": test_years, "price_col": price_col, "trade_ticker_count": len(trade_tickers)},
+    )
+    print(f"Saved run manifest to: {manifest_path}")
     report_path = generate_walk_forward_report(run_dir)
     print(f"Saved walk-forward HTML report to: {report_path}")

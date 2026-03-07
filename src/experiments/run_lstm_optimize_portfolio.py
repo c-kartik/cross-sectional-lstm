@@ -18,6 +18,7 @@ from src.optimize.mean_variance import MVConfig, mean_variance_weights
 from src.reporting.optimizer_report import generate_optimizer_report
 from src.signals.trend import above_sma
 from src.universe.custom import get_universe
+from src.utils.run_manifest import write_run_manifest
 
 TRADING_DAYS = 252
 
@@ -270,6 +271,15 @@ if __name__ == "__main__":
     if "daily_turnover" in result_base:
         result_base["daily_turnover"].to_csv(run_dir / "turnover_baseline.csv", header=True)
 
+    manifest_path = write_run_manifest(
+        run_dir,
+        script_name="src.experiments.run_lstm_optimize_portfolio",
+        run_id=run_id,
+        config=summary,
+        input_paths=[Path("data/prices"), Path("data/datasets/lstm_best.pt")],
+        extra={"price_col": price_col, "universe_count": len(universe), "trade_ticker_count": len(trade_tickers)},
+    )
+    print(f"Saved run manifest to: {manifest_path}")
     report_path = generate_optimizer_report(run_dir)
     print(f"Saved optimizer HTML report to: {report_path}")
     print(f"Saved optimized run to: {run_dir}")

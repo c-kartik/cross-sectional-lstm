@@ -16,6 +16,7 @@ from src.models.lstm import LSTMRegressor
 from src.optimize.mean_variance import MVConfig, mean_variance_weights
 from src.signals.trend import above_sma
 from src.universe.custom import get_universe
+from src.utils.run_manifest import write_run_manifest
 
 
 TRADING_DAYS = 252
@@ -283,20 +284,25 @@ if __name__ == "__main__":
     run_dir.mkdir(parents=True, exist_ok=True)
 
     (run_dir / "grid_summary.csv").write_text(out.to_csv(index=False))
-    (run_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "top_n": top_n,
-                "buffer_k": buffer_k,
-                "opt_top_k": opt_top_k,
-                "target_vol_annual": target_vol_annual,
-                "vol_lookback": vol_lookback,
-                "max_leverage": max_leverage,
-                "cost_bps": cost_bps,
-                "grid": grid,
-            },
-            indent=2,
-        )
+    config = {
+        "top_n": top_n,
+        "buffer_k": buffer_k,
+        "opt_top_k": opt_top_k,
+        "target_vol_annual": target_vol_annual,
+        "vol_lookback": vol_lookback,
+        "max_leverage": max_leverage,
+        "cost_bps": cost_bps,
+        "grid": grid,
+    }
+    (run_dir / "config.json").write_text(json.dumps(config, indent=2))
+    manifest_path = write_run_manifest(
+        run_dir,
+        script_name="src.experiments.run_lstm_optimize_grid",
+        run_id=run_id,
+        config=config,
+        input_paths=[Path("data/prices"), Path("data/datasets/lstm_best.pt")],
+        extra={"price_col": price_col, "universe_count": len(universe), "trade_ticker_count": len(trade_tickers)},
     )
 
     print(f"Saved grid summary to: {run_dir / 'grid_summary.csv'}")
+    print(f"Saved run manifest to: {manifest_path}")
