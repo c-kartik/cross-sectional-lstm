@@ -3,3 +3,6 @@ pandas>=2.0
 matplotlib>=3.7
 torch>=2.0
 yfinance>=0.2
+pandas_market_calendars>=4.4
+cvxpy>=1.4
+pytest>=8.0

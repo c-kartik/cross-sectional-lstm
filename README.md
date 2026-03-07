@@ -87,6 +87,70 @@ A single-user, local-first quant research project that:
 
 ---
 
+## Setup / How to run
+
+> Run commands from the project root with your venv active.
+
+### Data download + cache
+
+```bash
+python3 -m src.data.download_prices
+python3 -m src.data.inspect_cache
+python3 -m src.data.validate_prices
+```
+
+### Risk Engines (baselines)
+
+```bash
+python3 -m src.experiments.run_trend_vol
+python3 -m src.experiments.run_risk_parity
+```
+
+### LSTM Pipeline
+
+```bash
+python3 -m src.experiments.run_make_dataset
+python3 -m src.experiments.run_build_lstm_dataset
+python3 -m src.experiments.run_lstm_train
+python3 -m src.experiments.run_lstm_eval_ic
+python3 -m src.experiments.run_lstm_topn_backtest
+```
+
+### Mainline evaluation (default / headline results)
+
+Use the Top-N baseline as the primary portfolio construction layer:
+
+```bash
+python3 -m src.experiments.run_walk_forward
+```
+
+Outputs a shareable HTML report at:
+`reports/walk_forward/run_YYYYMMDD_HHMMSS/report.html`
+
+### Experimental optimization layer (R&D only)
+
+```bash
+python3 -m src.experiments.run_lstm_optimize_portfolio
+python3 -m src.experiments.run_lstm_optimize_grid
+```
+
+This optimizer path is kept for research and skill demonstration. It is
+currently not the default headline strategy because baseline Top-N has been
+more robust in recent runs.
+
+Reports:
+- `reports/lstm_optimize/run_YYYYMMDD_HHMMSS/report.html`
+- `reports/lstm_optimize_grid/run_YYYYMMDD_HHMMSS/grid_summary.csv`
+
+### Tests
+
+```bash
+pytest -q
+```
+
+CI runs this test suite automatically on push/PR via GitHub Actions.
+
+---
 ## Current state of the project
 
 Implemented so far:
@@ -102,6 +166,7 @@ Implemented so far:
   - vol targeting
   - benchmark + risk-matched comparisons
 - Walk-forward evaluation across multiple years (annual refits)
+- Mean-variance optimizer layer (cvxpy) implemented as experimental R&D module
 
 ## Research integrity (anti-lookahead + realism)
 - **No lookahead execution:** targets are applied **T+1** (rebalance signals shifted by 1 trading day).
@@ -137,5 +202,4 @@ python3 -m src.data.download_prices
 python3 -m src.experiments.run_walk_forward
 ```
 
-Outputs saved to: `reports/walk_forward_<timestamp>/` (equity PNG/CSV + summary CSVs)
-
+Outputs saved to: `reports/walk_forward/run_<timestamp>/` (equity PNG/CSV + summary CSVs)

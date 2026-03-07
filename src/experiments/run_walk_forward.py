@@ -15,6 +15,7 @@ from src.datasets.make_dataset import DatasetConfig, make_sequences
 from src.models.lstm import LSTMRegressor
 from src.signals.trend import above_sma
 from src.backtest.engine import run_backtest
+from src.reporting.walk_forward_report import generate_walk_forward_report
 import torch
 
 TRADING_DAYS = 252
@@ -143,7 +144,7 @@ if __name__ == "__main__":
     # Run output directory
     # ------------------------
     run_id = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path("reports") / f"walk_forward_{run_id}"
+    run_dir = Path("reports") / "walk_forward" / f"run_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Ensure checkpoint directory exists
@@ -423,3 +424,5 @@ if __name__ == "__main__":
     out.to_csv(run_dir / "seed_sweep_rows.csv", index=False)
     by_year.to_csv(run_dir / "seed_sweep_by_year.csv", index=False)
     overall.to_csv(run_dir / "seed_sweep_overall.csv", index=False)
+    report_path = generate_walk_forward_report(run_dir)
+    print(f"Saved walk-forward HTML report to: {report_path}")
